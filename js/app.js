@@ -1,17 +1,17 @@
-// WeSec v0.2 – You and me. Stop.
+// WeSec v0.3 – You and me. Stop.
 import * as C from './crypto.js';
 import { kvGet, kvSet, kvDel, kvClear } from './store.js';
 import { qrSVG } from './qr.js';
 
 const B = globalThis.__wesecBackend || (await import('./backend.js'));
-const VERSION = '0.2';
+const VERSION = '0.3';
 const COLORS = ['#a7d8f5', '#f8bfd4', '#cdbdf6', '#a8e6c3', '#fcd0a6', '#9fe3dc', '#f6b3b3', '#d6e8a4']; // pastello
 const PHRASES = ['Ricordati il pane', 'Hai una nota nuova', 'Controlla la lista', 'Promemoria'];
 const LOCK_HIDDEN_MS = 30000, LOCK_IDLE_MS = 5 * 60000, LIST_N = 25, CHAT_N = 150;
 
 const S = {
   vault: null, pk: null, uid: null, ready: null, initErr: null,
-  keys: new Map(), priv: new Map(), pkey: null, watch: new Map(), msgs: new Map(), dec: new Map(), media: new Map(),
+  keys: new Map(), priv: new Map(), queue: new Map(), qBusy: false, pkey: null, watch: new Map(), msgs: new Map(), dec: new Map(), media: new Map(),
   cur: null, inviteOff: null, hiddenAt: 0, picking: false, idleT: 0, keyH: null, saving: Promise.resolve(),
   el: {}, pendingCode: null, scanStop: null,
 };
@@ -178,7 +178,7 @@ function lock() {
   if (S.inviteOff) { S.inviteOff(); S.inviteOff = null; }
   stopScan();
   for (const u of S.media.values()) URL.revokeObjectURL(u);
-  S.media.clear(); S.msgs.clear(); S.dec.clear(); S.keys.clear(); S.priv.clear(); S.pkey = null;
+  S.media.clear(); S.msgs.clear(); S.dec.clear(); S.keys.clear(); S.priv.clear(); S.pkey = null; S.queue.clear();
   S.vault = null; S.pk = null; S.cur = null;
   document.body.classList.remove('in-chat');
   closeModal();
@@ -213,6 +213,8 @@ async function enterApp() {
   }
   saveVault();
   refreshPush();
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch { /* non supportato */ }
+  processQueue();
   if (S.pendingCode) { const c = S.pendingCode; S.pendingCode = null; openAdd('code', c); }
 }
 
@@ -302,7 +304,8 @@ function renderMsgs(forceBottom) {
   const box = S.el.msgs;
   if (!box || !S.cur) return;
   const near = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
-  const arr = [...(S.msgs.get(S.cur) || []), ...(S.priv.get(S.cur) || []).map((p) => ({ id: 'p' + p.id, ts: p.ts, mine: true, priv: true, d: { t: 'img', priv: true, ...p } }))].sort((a, b) => a.ts - b.ts);
+  const arr = [...(S.msgs.get(S.cur) || []), ...(S.priv.get(S.cur) || []).map((p) => ({ id: 'p' + p.id, ts: p.ts, mine: true, priv: true, d: { t: 'img', priv: true, ...p } })),
+    ...[...S.queue.values()].filter((q) => q.chat === S.cur && !(S.msgs.get(S.cur) || []).some((m) => m.id === q.fid)).map((q) => ({ id: 'q' + q.qid, ts: q.ts, mine: true, queued: true, priv: !q.visible, d: { t: 'img', id: q.fid, th: q.th } }))].sort((a, b) => a.ts - b.ts);
   const out = [];
   let day = '';
   if (arr.length >= CHAT_N) out.push(h('div', { class: 'sys' }, `Sono mostrati gli ultimi ${CHAT_N} messaggi`));
@@ -310,9 +313,9 @@ function renderMsgs(forceBottom) {
     const d = fmtDay(m.ts);
     if (d !== day) { day = d; out.push(h('div', { class: 'day' }, d)); }
     if (m.d.t === 'hello') { out.push(h('div', { class: 'sys' }, m.mine ? '🔒 Chat cifrata creata' : '🔒 Il contatto si è collegato')); continue; }
-    const t = h('span', { class: 't' }, (m.priv ? '🔒 Solo tu · ' : '') + fmtTime(m.ts) + (m.priv ? '' : m.mine ? (m.pending ? ' ⏱' : ' ✓') : ''));
+    const t = h('span', { class: 't' }, (m.priv ? '🔒 Solo tu · ' : '') + fmtTime(m.ts) + (m.queued ? ' ⏳ in caricamento' : m.priv ? '' : m.mine ? (m.pending ? ' ⏱' : ' ✓') : ''));
     if (m.d.t === 'text') out.push(h('div', { class: 'b' + (m.mine ? ' me' : '') }, h('p', null, m.d.text), t));
-    else if (m.d.t === 'img') out.push(h('div', { class: 'b img' + (m.priv ? ' priv' : m.mine ? ' me' : '') }, h('img', { src: m.d.th, alt: 'Foto', onclick: () => openImage(S.cur, m.d) }), t));
+    else if (m.d.t === 'img') out.push(h('div', { class: 'b img' + (m.priv ? ' priv' : m.mine ? ' me' : '') }, h('img', { src: m.d.th, alt: 'Foto', onclick: m.queued ? null : () => openImage(S.cur, m.d) }), t));
     else out.push(h('div', { class: 'sys' }, '⚠ Messaggio non leggibile'));
   }
   fill(box, ...out);
@@ -404,8 +407,8 @@ async function sendObj(id, obj) {
   try {
     const key = await chatKey(id);
     const box = await C.sealJSON(key, obj, id);
-    await B.sendMessage(id, box);
-    B.notify(id, S.vault.chats[id].token);
+    const token = S.vault.chats[id].token;
+    B.sendMessage(id, box).then(() => B.notify(id, token)).catch((e) => { console.warn(e); toast('Invio non riuscito'); });
   } catch (e) { console.warn(e); toast('Invio non riuscito'); }
 }
 async function toJpeg(bmp, max, q) {
@@ -416,19 +419,73 @@ async function toJpeg(bmp, max, q) {
   const blob = await new Promise((r) => cv.toBlob(r, 'image/jpeg', q));
   return { w, h: hh, bytes: new Uint8Array(await blob.arrayBuffer()), url: cv.toDataURL('image/jpeg', q) };
 }
-async function sendPhoto(id, file) {
-  const c = S.vault.chats[id];
+// ---------- coda di caricamento: le foto non si perdono se l'app si chiude ----------
+// La foto viene cifrata e salvata sul telefono PRIMA di partire; se l'invio si interrompe
+// riparte da sola al prossimo sblocco o quando torna la rete.
+async function enqueuePhoto(id, file, visible) {
   try {
-    toast('Cifro e carico la foto…', 8000);
+    toast('Preparo la foto…', 6000);
     const bmp = await createImageBitmap(file);
     const full = await toJpeg(bmp, 1600, 0.82), th = await toJpeg(bmp, 320, 0.6);
-    const fid = newId(), key = await chatKey(id);
-    const enc = await C.encBytes(key, full.bytes, id + '/' + fid);
-    await B.putFile(id, fid, c.token, enc.data);
-    await sendObj(id, { t: 'img', id: fid, iv: enc.iv, w: full.w, h: full.h, th: th.url, size: full.bytes.length });
-    toast('Foto caricata · visibile a tutti e due');
-  } catch (e) { console.warn(e); toast('Foto non inviata'); }
+    const fid = newId();
+    const enc = visible
+      ? await C.encBytes(await chatKey(id), full.bytes, id + '/' + fid)
+      : await C.encBytes(await personalKey(), full.bytes, 'me/' + id + '/' + fid);
+    const meta = { qid: fid, chat: id, visible, fid, iv: enc.iv, w: full.w, h: full.h, th: th.url, size: full.bytes.length, ts: Date.now(), uploaded: false };
+    await kvSet('q:' + fid, { box: await C.sealJSON(S.pk, meta, 'q'), data: enc.data });
+    const idx = (await kvGet('queue')) || [];
+    idx.push(fid); await kvSet('queue', idx);
+    S.queue.set(fid, meta);
+    if (S.cur === id) renderMsgs(true);
+    processQueue();
+  } catch (e) { console.warn(e); toast('Foto non preparata'); }
 }
+async function dropQ(qid) {
+  const idx = ((await kvGet('queue')) || []).filter((x) => x !== qid);
+  await kvSet('queue', idx); await kvDel('q:' + qid); S.queue.delete(qid);
+}
+async function processQueue() {
+  if (S.qBusy || !S.vault || S.initErr) return;
+  S.qBusy = true;
+  let changed = new Set();
+  try {
+    for (const qid of (await kvGet('queue')) || []) {
+      if (!S.vault) break;
+      const rec = await kvGet('q:' + qid);
+      if (!rec) { await dropQ(qid); continue; }
+      let meta;
+      try { meta = await C.openJSON(S.pk, rec.box, 'q'); } catch { continue; }
+      const c = S.vault.chats[meta.chat];
+      if (!c) { await dropQ(qid); continue; }
+      S.queue.set(qid, meta); changed.add(meta.chat);
+      try {
+        if (!meta.uploaded) {
+          await B.putFile(meta.chat, meta.fid, c.token, rec.data);
+          meta.uploaded = true;
+          await kvSet('q:' + qid, { box: await C.sealJSON(S.pk, meta, 'q'), data: rec.data });
+        }
+        if (meta.visible) {
+          const box = await C.sealJSON(await chatKey(meta.chat), { t: 'img', id: meta.fid, iv: meta.iv, w: meta.w, h: meta.h, th: meta.th, size: meta.size }, meta.chat);
+          const ack = B.sendMessage(meta.chat, box, meta.fid); // scrittura locale già salvata su disco
+          ack.then(() => B.notify(meta.chat, c.token)).catch(() => {});
+          await new Promise((r) => setTimeout(r, 300));
+        } else {
+          const arr = await loadPriv(meta.chat);
+          if (!arr.some((x) => x.id === meta.fid)) arr.push({ id: meta.fid, iv: meta.iv, w: meta.w, h: meta.h, th: meta.th, ts: meta.ts });
+          await savePrivList(meta.chat);
+        }
+        await dropQ(qid);
+        toast(meta.visible ? 'Foto caricata · visibile a tutti e due' : 'Foto caricata · la vedi solo tu 🔒');
+      } catch (e) { console.warn(e); toast('Foto in attesa di rete: partirà da sola'); break; }
+    }
+  } finally {
+    S.qBusy = false;
+    if (S.cur && changed.has(S.cur)) { renderMsgs(true); renderSide(); }
+  }
+}
+addEventListener('online', () => processQueue());
+addEventListener('beforeunload', (e) => { if (S.queue.size) { e.preventDefault(); e.returnValue = ''; } });
+
 
 // ---------- foto "solo per me" ----------
 async function personalKey() {
@@ -448,22 +505,6 @@ async function loadPriv(id) {
 async function savePrivList(id) {
   await kvSet('priv:' + id, await C.sealJSON(S.pk, S.priv.get(id) || [], 'priv:' + id));
 }
-async function savePrivate(id, file) {
-  const c = S.vault.chats[id];
-  try {
-    toast('Cifro e carico la foto…', 8000);
-    const bmp = await createImageBitmap(file);
-    const full = await toJpeg(bmp, 1600, 0.82), th = await toJpeg(bmp, 320, 0.6);
-    const fid = newId();
-    const enc = await C.encBytes(await personalKey(), full.bytes, 'me/' + id + '/' + fid);
-    await B.putFile(id, fid, c.token, enc.data);
-    const arr = await loadPriv(id);
-    arr.push({ id: fid, iv: enc.iv, w: full.w, h: full.h, th: th.url, ts: Date.now() });
-    await savePrivList(id);
-    if (S.cur === id) { renderMsgs(true); renderSide(); }
-    toast('Foto caricata · la vedi solo tu 🔒');
-  } catch (e) { console.warn(e); toast('Foto non salvata'); }
-}
 function openPhotoPreview(id, file) {
   const url = URL.createObjectURL(file);
   const c = S.vault.chats[id];
@@ -474,7 +515,7 @@ function openPhotoPreview(id, file) {
   const card = openModal('Carica foto',
     h('img', { src: url, alt: '', class: 'preview' }),
     h('label', { class: 'check' }, box, h('span', null, h('b', null, `👁 Visibile anche a ${chatName(c)}`), hint)),
-    h('button', { class: 'btn', onclick: () => { closeModal(); (box.checked ? sendPhoto : savePrivate)(id, file); } }, 'Carica'),
+    h('button', { class: 'btn', onclick: () => { closeModal(); enqueuePhoto(id, file, box.checked); } }, 'Carica'),
     h('button', { class: 'btn sec', onclick: closeModal }, 'Annulla'));
   const free = () => URL.revokeObjectURL(url);
   card.querySelector('img.preview').addEventListener('load', () => setTimeout(free, 1000), { once: true });
@@ -489,7 +530,8 @@ async function makeVisible(id, d) {
     const fid = newId();
     const enc = await C.encBytes(await chatKey(id), bytes, id + '/' + fid);
     await B.putFile(id, fid, c.token, enc.data);
-    await sendObj(id, { t: 'img', id: fid, iv: enc.iv, w: d.w, h: d.h, th: d.th, size: bytes.length });
+    const box = await C.sealJSON(await chatKey(id), { t: 'img', id: fid, iv: enc.iv, w: d.w, h: d.h, th: d.th, size: bytes.length }, id);
+    B.sendMessage(id, box, fid).then(() => B.notify(id, c.token)).catch(() => {});
     S.priv.set(id, (S.priv.get(id) || []).filter((x) => x.id !== d.id));
     await savePrivList(id);
     if (S.cur === id) { renderMsgs(true); renderSide(); }

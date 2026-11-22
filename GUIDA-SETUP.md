@@ -1,4 +1,4 @@
-# WeSec 0.2 – Guida di installazione
+# WeSec 0.3 – Guida di installazione
 
 Tempo: circa 20 minuti, una volta sola. Tutto gratuito, senza carta su Firebase.
 

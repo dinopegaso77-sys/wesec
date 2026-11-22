@@ -10,7 +10,9 @@ export async function init() {
   fb = await import(`https://www.gstatic.com/firebasejs/${V}/firebase-firestore.js`);
   const fa = app.initializeApp(CONFIG.firebase);
   auth = a.getAuth(fa);
-  db = fb.getFirestore(fa);
+  // Cache su disco: i messaggi scritti senza rete partono anche dopo aver chiuso l'app
+  try { db = fb.initializeFirestore(fa, { localCache: fb.persistentLocalCache({ tabManager: fb.persistentMultipleTabManager() }) }); }
+  catch { db = fb.getFirestore(fa); }
   await a.setPersistence(auth, a.indexedDBLocalPersistence);
   uid = await new Promise((res, rej) => {
     const off = a.onAuthStateChanged(auth, (u) => {
@@ -41,8 +43,12 @@ export async function acceptInvite(code, inv, chatId, pubB) {
 export const deleteInvite = (code) => fb.deleteDoc(fb.doc(db, 'invites', code)).catch(() => {});
 
 // ---- messaggi ----
-export async function sendMessage(chatId, box) {
-  await fb.addDoc(fb.collection(db, 'chats', chatId, 'messages'), { from: uid, ts: fb.serverTimestamp(), iv: box.iv, ct: box.ct });
+// Con msgId fisso un nuovo tentativo non crea doppioni.
+// Restituisce subito dopo la scrittura locale (che sopravvive alla chiusura) e la promessa di conferma dal server.
+export function sendMessage(chatId, box, msgId) {
+  const data = { from: uid, ts: fb.serverTimestamp(), iv: box.iv, ct: box.ct };
+  const ref = msgId ? fb.doc(db, 'chats', chatId, 'messages', msgId) : fb.doc(fb.collection(db, 'chats', chatId, 'messages'));
+  return fb.setDoc(ref, data);
 }
 export function watchMessages(chatId, n, cb, onErr) {
   const q = fb.query(fb.collection(db, 'chats', chatId, 'messages'), fb.orderBy('ts', 'desc'), fb.limit(n));
