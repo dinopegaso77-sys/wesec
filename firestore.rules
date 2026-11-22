@@ -1,0 +1,53 @@
+rules_version = '2';
+// WeSec – regole Firestore
+// Ogni chat è leggibile e scrivibile solo dai suoi due membri.
+// I messaggi sono già cifrati sul telefono: qui arrivano solo dati illeggibili.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function isMember(chatId) {
+      return signedIn() && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.members;
+    }
+
+    // Inviti: si leggono solo conoscendo il codice, scadono in pochi minuti, valgono una volta
+    match /invites/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['from', 'pubA', 'expires', 'accepted'])
+        && request.resource.data.from == request.auth.uid
+        && request.resource.data.accepted == false
+        && request.resource.data.expires is timestamp
+        && request.resource.data.expires < request.time + duration.value(15, 'm');
+      allow update: if signedIn()
+        && resource.data.accepted == false
+        && request.time < resource.data.expires
+        && request.auth.uid != resource.data.from
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['accepted', 'pubB', 'uidB', 'chatId'])
+        && request.resource.data.accepted == true
+        && request.resource.data.uidB == request.auth.uid;
+      allow delete: if signedIn() && resource.data.from == request.auth.uid;
+    }
+
+    match /chats/{chatId} {
+      allow get: if signedIn() && request.auth.uid in resource.data.members;
+      allow list: if false;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['members', 'created'])
+        && request.resource.data.members.size() == 2
+        && request.auth.uid in request.resource.data.members;
+      allow update, delete: if false;
+
+      match /messages/{msgId} {
+        allow read: if isMember(chatId);
+        allow create: if isMember(chatId)
+          && request.resource.data.keys().hasOnly(['from', 'ts', 'iv', 'ct'])
+          && request.resource.data.from == request.auth.uid
+          && request.resource.data.ts == request.time
+          && request.resource.data.ct is string
+          && request.resource.data.ct.size() < 700000;
+        allow delete: if isMember(chatId) && resource.data.from == request.auth.uid;
+      }
+    }
+  }
+}
